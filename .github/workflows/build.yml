@@ -1,0 +1,161 @@
+# Builds the Pharmivo POS Windows installer and Android app, and publishes them as a release here.
+#
+# Why here: this repository is public, and GitHub Actions is free with no minute limit for public
+# repositories. The app's code stays in the private repo asadrealestatewala/Pharmivo-POS; this workflow
+# reads it with a token and never copies it into this repository. Only the finished installers are
+# published here (as before). Build logs are public, so nothing secret is ever printed.
+#
+# Start it by hand: Actions tab -> "Build apps" -> Run workflow.
+#   source_ref  branch or tag of Pharmivo-POS to build (default main)
+#   publish     publish the version in package.json as a release (customers get it); untick for a test build
+#
+# Secrets (this repo: Settings -> Secrets and variables -> Actions):
+#   SOURCE_TOKEN               fine-grained token with "Contents: Read-only" on Pharmivo-POS
+#   ANDROID_KEYSTORE_BASE64    the Android signing key (base64), never change it
+#   ANDROID_KEYSTORE_PASSWORD  its password
+# Publishing uses this repository's own built-in token, so no other token is needed.
+name: Build apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Pharmivo-POS branch or tag to build
+        default: main
+        required: true
+      publish:
+        description: Publish this version as a release (customers get it)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apps
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: asadrealestatewala/Pharmivo-POS
+  PUBLISH: ${{ inputs.publish }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # electron-builder creates the release in this repo
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Download Electron and the SQLite module built for it
+        shell: bash
+        run: |
+          node node_modules/electron/install.js
+          cd node_modules/better-sqlite3
+          npx --yes prebuild-install -r electron -t "$(node -p "require('electron/package.json').version")" --arch x64 --platform win32
+      - run: npm run build
+      - run: npm run bundle
+      - name: Build installer (test build)
+        if: env.PUBLISH != 'true'
+        run: npx electron-builder --win nsis portable --x64 --publish never
+      - name: Build installer and publish the release
+        if: env.PUBLISH == 'true'
+        run: npx electron-builder --win nsis portable --x64 --publish always
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pharmivo-windows
+          path: |
+            release/*.exe
+            release/latest.yml
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npx cap sync android
+      - name: Version numbers from package.json
+        run: |
+          v=$(node -p "require('./package.json').version")
+          IFS=. read -r a b c <<< "$v"
+          echo "APP_VERSION=$v" >> "$GITHUB_ENV"
+          echo "APP_VERSION_CODE=$((a * 10000 + b * 100 + c))" >> "$GITHUB_ENV"
+      - name: Signing key
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > "$RUNNER_TEMP/pharmivo.jks"
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/pharmivo.jks" >> "$GITHUB_ENV"
+            echo "::add-mask::$KS_PASS"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+            echo "SIGNED=1" >> "$GITHUB_ENV"
+          elif [ "$PUBLISH" = "true" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is missing; a release must be signed with the permanent key"; exit 1
+          else
+            echo "No signing key: building a test (debug) APK"
+          fi
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          if [ -n "$SIGNED" ]; then ./gradlew --no-daemon assembleRelease; cp app/build/outputs/apk/release/app-release.apk ../Pharmivo-POS-Android.apk
+          else ./gradlew --no-daemon assembleDebug; cp app/build/outputs/apk/debug/app-debug.apk ../Pharmivo-POS-Android.apk; fi
+      - name: Remove the signing key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/pharmivo.jks"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pharmivo-android
+          path: Pharmivo-POS-Android.apk
+          if-no-files-found: error
+
+  # Adds the APK to the release that the Windows job created.
+  publish-android:
+    if: inputs.publish
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: package.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: pharmivo-android
+      - name: Upload APK to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v$(node -p "require('./package.json').version")" Pharmivo-POS-Android.apk --repo "${{ github.repository }}" --clobber
